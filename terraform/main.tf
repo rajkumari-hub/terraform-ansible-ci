@@ -109,9 +109,9 @@ resource "aws_instance" "frontend" {
   associate_public_ip_address = true
 
   tags = {
-    Name = "c8.local"
+    Name     = "c8.local"
     Hostname = "c8.local"
-    Role = "frontend"
+    Role     = "frontend"
   }
 }
 
@@ -124,9 +124,9 @@ resource "aws_instance" "backend" {
   associate_public_ip_address = true
 
   tags = {
-    Name = "u21.local"
+    Name     = "u21.local"
     Hostname = "u21.local"
-    Role = "backend"
+    Role     = "backend"
   }
 }
 
