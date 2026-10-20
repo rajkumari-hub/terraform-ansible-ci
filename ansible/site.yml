@@ -1,1 +1,172 @@
 
+---
+- name: Configure common operating system settings
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Set hostname to inventory alias
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Install SELinux management tools on Amazon Linux
+      ansible.builtin.dnf:
+        name: python3-libselinux
+        state: present
+      when: ansible_facts['os_family'] == "RedHat"
+
+    - name: Disable SELinux on supported systems
+      ansible.posix.selinux:
+        state: disabled
+      when: ansible_facts['os_family'] == "RedHat"
+
+    - name: Check whether firewalld is installed
+      ansible.builtin.command: rpm -q firewalld
+      register: firewalld_check
+      changed_when: false
+      failed_when: false
+      when: ansible_facts['os_family'] == "RedHat"
+
+    - name: Stop and disable firewalld if installed
+      ansible.builtin.systemd:
+        name: firewalld
+        state: stopped
+        enabled: false
+      when:
+        - ansible_facts['os_family'] == "RedHat"
+        - firewalld_check.rc == 0
+
+    - name: Check whether firewalld is installed on Ubuntu
+      ansible.builtin.command: dpkg-query -W -f='${Status}' firewalld
+      register: ubuntu_firewalld_check
+      changed_when: false
+      failed_when: false
+      when: ansible_facts['os_family'] == "Debian"
+
+    - name: Stop and disable firewalld on Ubuntu if installed
+      ansible.builtin.systemd:
+        name: firewalld
+        state: stopped
+        enabled: false
+      when:
+        - ansible_facts['os_family'] == "Debian"
+        - ubuntu_firewalld_check.rc == 0
+        - "'install ok installed' in ubuntu_firewalld_check.stdout"
+
+
+- name: Install and configure Netdata backend
+  hosts: backend
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.package:
+        name:
+          - curl
+          - ca-certificates
+        state: present
+        update_cache: "{{ ansible_facts['os_family'] == 'Debian' }}"
+
+    - name: Install Netdata using its official installer
+      ansible.builtin.shell: |
+        set -o pipefail
+        curl -fsSL https://get.netdata.cloud/kickstart.sh \
+          -o /tmp/netdata-kickstart.sh
+        bash /tmp/netdata-kickstart.sh --stable-channel --non-interactive
+      args:
+        executable: /bin/bash
+        creates: /usr/sbin/netdata
+
+    - name: Configure Netdata to listen on port 19999
+      ansible.builtin.blockinfile:
+        path: /etc/netdata/netdata.conf
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED NETDATA WEB CONFIG"
+        block: |
+          [web]
+              default port = 19999
+              bind to = *
+      notify: Restart Netdata
+
+    - name: Enable and start Netdata
+      ansible.builtin.systemd:
+        name: netdata
+        state: started
+        enabled: true
+
+    - name: Apply pending Netdata configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify Netdata responds locally
+      ansible.builtin.uri:
+        url: http://127.0.0.1:19999/api/v1/info
+        status_code: 200
+      register: netdata_health
+      retries: 12
+      delay: 5
+      until: netdata_health.status == 200
+
+  handlers:
+    - name: Restart Netdata
+      ansible.builtin.systemd:
+        name: netdata
+        state: restarted
+
+
+- name: Configure Nginx frontend reverse proxy
+  hosts: frontend
+  become: true
+  gather_facts: true
+
+  vars:
+    backend_ip: "{{ hostvars[groups['backend'][0]]['ansible_host'] }}"
+
+  tasks:
+    - name: Install Nginx
+      ansible.builtin.package:
+        name: nginx
+        state: present
+
+    - name: Configure Nginx reverse proxy
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/netdata-proxy.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              server_name _;
+
+              location / {
+                  proxy_pass http://{{ backend_ip }}:19999;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+      notify: Restart Nginx
+
+    - name: Enable and start Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Validate Nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Apply pending Nginx configuration
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Restart Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
